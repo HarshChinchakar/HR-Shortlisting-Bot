@@ -30,11 +30,15 @@ import streamlit as st
 import numpy as np
 
 # Attempt to import openai. If missing, error out with a helpful message.
+# OpenAI client (new interface >=1.0.0)
 try:
-    import openai
+    from openai import OpenAI
+    # Note: we will construct `client` in main() after reading env vars.
+    client = None
 except Exception as e:
     print("❌ The 'openai' package is required for this updated script. Please `pip install openai`.", file=sys.stderr)
     raise
+
 
 # -----------------------
 # Config / Paths
