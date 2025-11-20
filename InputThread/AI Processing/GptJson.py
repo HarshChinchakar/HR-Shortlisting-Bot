@@ -7,10 +7,11 @@ Rich Resume TXT -> Normalized JSON converter
 """
 
 import os
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
 # Load from your .env file
-load_dotenv(".env")
+# load_dotenv(".env")
+
 
 # ---------------------------
 # PATHS & CONFIG
@@ -19,7 +20,7 @@ JD_JSON = "InputThread/JD/JD.json"
 INPUT_DIR = "Processed-TXT"
 OUTPUT_DIR = "ProcessedJson"
 LOG_FILE = "processing_errors.log1"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 MODEL_NAME = "gpt-4.1-nano"   # inexpensive model that supports function calling
 MAX_RESPONSE_TOKENS = 2500
 # ---------------------------
