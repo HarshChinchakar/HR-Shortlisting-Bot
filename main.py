@@ -73,7 +73,6 @@ def clear_previous_run():
 def main():
     st.set_page_config(page_title="HR Resume Processor", layout="wide")
 
-    # Custom styling for a professional look
     st.markdown(
         """
         <style>
@@ -105,47 +104,26 @@ def main():
 
     st.markdown('<div class="main-title">📄 AI Resume Screening Platform</div>', unsafe_allow_html=True)
 
-    # Tabs (Documentation first, then JD, Resumes, Rankings)
     tabs = st.tabs(["📘 Documentation", "📌 Upload Requirements", "📁 Upload Resumes", "🏆 Rankings"])
 
     # ---------------- Tab 1: Documentation ----------------
     with tabs[0]:
         st.markdown('<div class="sub-header">📘 How the System Works</div>', unsafe_allow_html=True)
-
         st.markdown("""
         Welcome to the **AI Resume Screening Platform**.  
         This tool automates resume evaluation against Job Descriptions (JDs).  
         
         ### 🔄 Data Flow:
-        1. **Upload JD** → Extracted and processed with AI to capture role-specific keywords.
-        2. **Upload Resumes** → Extracted and converted to structured text.
-        3. **AI Processing** → Each resume analyzed for:
-            - Technical skills
-            - Domain relevance
-            - Projects & experience
-        4. **Ranking** → Candidates are scored & sorted based on JD alignment.
-
-        ### ⚠️ Precautions:
-        - Ensure resumes are in **PDF format**.
-        - JD should be **specific and complete** for better ranking accuracy.
-        - Avoid duplicate resumes; only latest versions should be uploaded.
-
-        ### ✅ Ideal Steps:
-        1. Upload the **Job Description** (PDF or text).
-        2. Process JD using **"⚙️ Process JD"** button.
-        3. Upload all **Resumes** in PDF format.
-        4. Click **"⚙️ Process & Rank Resumes"**.
-        5. View/download results from **Rankings tab**.
+        1. **Upload JD**
+        2. **Upload Resumes**
+        3. **AI Processing**
+        4. **Ranking**
         """)
 
     # ---------------- Tab 2: Upload JD ----------------
     with tabs[1]:
         st.markdown('<div class="sub-header">📌 Job Description Input</div>', unsafe_allow_html=True)
-        st.info(
-            "- Upload the official Job Description PDF.\n"
-            "- Or paste raw JD text in the text area below.\n"
-            "- This will be used as the benchmark for evaluating resumes."
-        )
+        st.info("- Upload JD PDF or paste JD text below.")
 
         jd_pdf = st.file_uploader("Upload JD (PDF only):", type=["pdf"], key="jd_pdf")
         jd_text_input = st.text_area("Or paste JD text here:", height=200, key="jd_text")
@@ -159,40 +137,31 @@ def main():
                 try:
                     pdf_text = extract_pdf_text(tmp_path)
                     final_text += pdf_text + "\n"
-                    st.success("📄 Extracted text from uploaded JD PDF.")
                 except Exception as e:
                     st.error(f"❌ Error extracting PDF: {e}")
 
             if jd_text_input.strip():
                 final_text += jd_text_input.strip()
-                st.success("📝 Added text input to JD.")
 
             if final_text.strip():
                 with open(JD_FILE, "w", encoding="utf-8") as f:
                     f.write(final_text.strip())
-                st.success(f"✅ JD saved at {JD_FILE}")
 
-                try:
-                    st.info("🔄 Running AI JD processing...")
-                    subprocess.run(
-                        ["python3", "InputThread/AI Processing/JDGpt.py"],
-                        check=True
-                    )
-                    st.success("🎯 JD processing complete!")
-                    st.session_state.jd_done = True
-                except subprocess.CalledProcessError as e:
-                    st.error(f"❌ Error running JDGpt.py: {e}")
+                st.info("🔄 Running AI JD processing...")
+
+                # 🔥 main-thread import + execute (NO SUBPROCESS)
+                from InputThread.AI_Processing.JDGpt import process_jd
+                process_jd()
+
+                st.success("🎯 JD processing complete!")
+                st.session_state.jd_done = True
             else:
-                st.warning("⚠️ Please upload a JD PDF or enter text before processing.")
+                st.warning("⚠️ Upload a JD PDF or enter JD text before processing.")
 
     # ---------------- Tab 3: Upload Resumes ----------------
     with tabs[2]:
         st.markdown('<div class="sub-header">📁 Upload Resume Folder (PDFs only)</div>', unsafe_allow_html=True)
-        st.info(
-            "- Upload one or multiple resumes in **PDF format**.\n"
-            "- Each resume will be extracted into plain text.\n"
-            "- Only supported and readable resumes will be processed."
-        )
+        st.info("- Upload multiple resumes in PDF format.")
 
         uploaded_files = st.file_uploader(
             "Upload multiple PDF resumes:",
@@ -200,13 +169,11 @@ def main():
             accept_multiple_files=True
         )
 
-        # Show already processed resumes
         processed_files = list(PROCESSED_TXT_DIR.glob("*.txt"))
         if processed_files:
             st.markdown("### 📂 Already Processed Resumes:")
-            with st.container():
-                for txt_file in processed_files:
-                    st.text(txt_file.name)
+            for txt_file in processed_files:
+                st.text(txt_file.name)
 
         if uploaded_files:
             for file in uploaded_files:
@@ -223,46 +190,39 @@ def main():
                     st.error(f"❌ Error processing {file.name}: {e}")
 
             if st.button("⚙️ Process & Rank Resumes", disabled=st.session_state.get("pipeline_ran", False)):
-                if not st.session_state.get("pipeline_ran", False):
-                    st.session_state.pipeline_ran = True
 
-                    steps = [
-                        ("Running AI processing (TXT → JSON)...",
-                         ["python3", "InputThread/AI Processing/GptJson.py"]),
-                        ("Running ProjectProcess.py ...",
-                         ["python3", "ResumeProcessor/ProjectProcess.py"]),
-                        ("Running KeywordComparitor.py ...",
-                         ["python3", "ResumeProcessor/KeywordComparitor.py"]),
-                        ("Running SemanticComparitor.py ...",
-                         ["python3", "ResumeProcessor/SemanticComparitor.py"]),
-                        ("Running FinalRanking.py ...",
-                         ["python3", str(FINAL_RANKING_SCRIPT)]),
-                    ]
+                st.session_state.pipeline_ran = True
+                progress = st.progress(0)
 
-                    progress = st.progress(0)
-                    total = len(steps)
+                # 🔥 direct callable imports (NO SUBPROCESS)
+                from InputThread.AI_Processing.GptJson import process_resumes_to_json
+                from ResumeProcessor.ProjectProcess import process_projects
+                from ResumeProcessor.KeywordComparitor import compare_keywords
+                from ResumeProcessor.SemanticComparitor import semantic_compare
+                from ResumeProcessor.Ranker.FinalRanking import generate_final_ranking
 
-                    for i, (msg, cmd) in enumerate(steps, start=1):
-                        try:
-                            st.info(msg)
-                            subprocess.run(cmd, check=True)
-                            progress.progress(i / total)
-                        except subprocess.CalledProcessError as e:
-                            st.error(f"❌ Error running {cmd}: {e}")
-                            break
+                steps = [
+                    ("Running AI processing (TXT → JSON)...", process_resumes_to_json),
+                    ("Running ProjectProcess.py ...", process_projects),
+                    ("Running KeywordComparitor.py ...", compare_keywords),
+                    ("Running SemanticComparitor.py ...", semantic_compare),
+                    ("Running FinalRanking.py ...", generate_final_ranking),
+                ]
 
-                    if i == total:
-                        st.success("🎯 Resume ranking complete!")
-                        st.session_state.active_tab = 3  # auto-jump to Rankings
+                total = len(steps)
+
+                for i, (msg, func) in enumerate(steps, start=1):
+                    st.info(msg)
+                    func()    # 🔥 main thread execution
+                    progress.progress(i / total)
+
+                st.success("🎯 Resume ranking complete!")
+                st.session_state.active_tab = 3
 
     # ---------------- Tab 4: Rankings ----------------
     with tabs[3]:
         st.markdown('<div class="sub-header">🏆 Final Rankings</div>', unsafe_allow_html=True)
-        st.info(
-            "- Ranked candidates based on JD alignment.\n"
-            "- Higher scores = stronger match to the requirements.\n"
-            "- You can scroll and also download the ranking file."
-        )
+        st.info("- Download the ranked results.")
 
         if DISPLAY_RANKS.exists():
             with open(DISPLAY_RANKS, "r", encoding="utf-8") as f:
@@ -270,7 +230,6 @@ def main():
 
             if lines:
                 st.success(f"Showing {len(lines)} ranked candidates")
-
                 st.dataframe({"Ranked Candidates": lines})
 
                 with open(DISPLAY_RANKS, "rb") as f:
@@ -281,14 +240,14 @@ def main():
                         mime="text/plain"
                     )
             else:
-                st.info("Ranking file is empty. Run the pipeline first.")
+                st.info("Ranking file is empty.")
         else:
-            st.info("No rankings available yet. Run 'Process & Rank Resumes' first.")
+            st.info("No rankings available yet.")
 
         if st.button("🗑️ Clear Previous Run Data"):
             cleared = clear_previous_run()
             if cleared:
-                st.success(f"✅ Cleared {len(cleared)} files")
+                st.success(f"Cleared {len(cleared)} files")
             else:
                 st.info("No files to clear.")
 
