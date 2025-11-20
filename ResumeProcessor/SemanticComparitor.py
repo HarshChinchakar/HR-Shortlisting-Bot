@@ -1,42 +1,50 @@
 #!/usr/bin/env python3
 """
-SemanticComparitor.py
+SemanticComparitor.py (updated to use OpenAI embeddings)
 
-Run (from main or terminal):
-subprocess.run(
-    ["python3", "/home/harshchinchakar/WORK Files/HR Bot/ResumeProcessor/SemanticComparitor.py"],
-    check=True
-)
-
+Behavior preserved:
 - Reads JD JSON from InputThread/JD/*.json (first found)
 - Reads resume JSONs from ../ProcessedJson
-- Uses local sentence-transformers model to embed sentences
 - Computes section-level semantic matching, aggregates into Semantic_Score (0..1)
-- Merges Semantic_Score into /home/harshchinchakar/WORK Files/HR Bot/Scores.json
-- Prints Top 10 by Semantic_Score
-"""
+- Merges Semantic_Score into Ranking/Scores.json
+- Prints / logs top results (keeps same output structure)
 
+Embedding change:
+- Replaced sentence-transformers with OpenAI embeddings (text-embedding-3-small by default)
+- Added cache (pickle) to avoid re-embedding identical strings
+- Batch requests and exponential backoff retries
+"""
 import json
 import sys
 import os
 import hashlib
 import pickle
 import tempfile
+import time
+import random
 from pathlib import Path
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+
+# Attempt to import openai. If missing, error out with a helpful message.
+try:
+    import openai
+except Exception as e:
+    print("❌ The 'openai' package is required for this updated script. Please `pip install openai`.", file=sys.stderr)
+    raise
 
 # -----------------------
 # Config / Paths
 # -----------------------
-MODEL_NAME = "all-MiniLM-L6-v2"  # fast & lightweight; swap to all-mpnet-base-v2 for more quality
+EMBEDDING_MODEL = "text-embedding-3-small"  # smaller, faster, lower-cost good default. Change if needed.
 EMBED_BATCH = 128
+EMBED_RETRIES = 5
+EMBED_BACKOFF_BASE = 1.2
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT_DIR = SCRIPT_DIR.parent  # /home/.../HR Bot
+ROOT_DIR = SCRIPT_DIR.parent  # assumes repo layout unchanged
 PROCESSED_JSON_DIR = (ROOT_DIR / "ProcessedJson").resolve()
 JD_DIR = (ROOT_DIR / "InputThread" / "JD").resolve()
 SCORES_FILE = Path("Ranking/Scores.json")
@@ -44,7 +52,7 @@ SCORES_FILE = Path("Ranking/Scores.json")
 # Local embedding cache file (pickle-backed dict) to avoid re-embedding text repeatedly
 EMBED_CACHE_PATH = SCRIPT_DIR / ".semantic_embed_cache.pkl"
 
-# Thresholds & weights
+# Thresholds & weights (same as before)
 TAU_COV = 0.65      # JD sentence coverage threshold
 TAU_RESUME = 0.55   # resume-side threshold
 SECTION_COMB = (0.5, 0.4, 0.1)  # (coverage, depth, density)
@@ -58,8 +66,7 @@ SECTION_WEIGHTS = {
     "overall": 0.10
 }
 
-# Safety: maximum sentences to embed per resume section to keep memory low (trim very long sections)
-MAX_SENT_PER_SECTION = 200
+MAX_SENT_PER_SECTION = 200  # safety cap
 
 # -----------------------
 # Utilities: embed cache
@@ -81,13 +88,22 @@ class EmbedCache:
 
     def get(self, text: str, model: str):
         k = self._key(text, model)
-        return self._cache.get(k)
+        v = self._cache.get(k)
+        if v is None:
+            return None
+        # restore numpy array (stored as list or array)
+        arr = np.asarray(v, dtype=np.float32)
+        # normalize defensively
+        norm = np.linalg.norm(arr)
+        if norm > 0:
+            return (arr / norm).astype(np.float32)
+        return arr.astype(np.float32)
 
     def set(self, text: str, model: str, vector: np.ndarray):
         k = self._key(text, model)
-        # store as bytes to keep pickle smaller
-        self._cache[k] = vector.astype(np.float32)
-        # occasional flush to disk (lightweight)
+        # store as list to be robust across pickle versions
+        self._cache[k] = vector.astype(np.float32).tolist()
+        # occasional flush (every 1000 entries)
         if len(self._cache) % 1000 == 0:
             self.flush()
 
@@ -116,7 +132,6 @@ def norm(s: str) -> str:
 def sentence_split(text: str) -> List[str]:
     if not text:
         return []
-    # simple, robust splitter; avoids heavy NLP libs
     text = text.replace("\r\n", " ").replace("\n", " ")
     parts = []
     start = 0
@@ -129,7 +144,6 @@ def sentence_split(text: str) -> List[str]:
     tail = text[start:].strip()
     if tail:
         parts.append(tail)
-    # filter tiny sentences
     parts = [p for p in parts if len(p.split()) >= 3]
     return parts
 
@@ -138,12 +152,9 @@ def safe_list_extract(x):
 
 # -----------------------
 # Section extractor
+# (kept identical to original logic)
 # -----------------------
 def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
-    """
-    Return dict of sections -> list of sentences (strings).
-    Use only JSON (no TXT).
-    """
     sections = {
         "profile": [],
         "skills": [],
@@ -153,12 +164,10 @@ def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
         "overall": []
     }
 
-    # profile_keywords_line
     p = resume.get("profile_keywords_line") or ""
     if p:
         sections["profile"].extend(sentence_split(p))
 
-    # skills: combine canonical_skills (flat tokens) + inferred_skills (high confidence)
     canonical = resume.get("canonical_skills") or {}
     skills_tokens = []
     for vals in canonical.values():
@@ -167,10 +176,8 @@ def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
     for inf in safe_list_extract(resume.get("inferred_skills") or []):
         if inf.get("skill") and inf.get("confidence", 0) >= 0.6:
             skills_tokens.append(norm(inf.get("skill")))
-    # store as short phrase sentences
     sections["skills"].extend(skills_tokens)
 
-    # projects: combine project.name + approach + tech_keywords
     for proj in safe_list_extract(resume.get("projects") or []):
         name = proj.get("name") or ""
         approach = proj.get("approach") or ""
@@ -180,10 +187,8 @@ def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
         if approach:
             sections["projects"].extend(sentence_split(approach))
         if tk:
-            # treat tech keywords as short phrases
             sections["projects"].extend([norm(x) for x in tk if x])
 
-    # experience: responsibilities_keywords + achievements + primary_tech
     for exp in safe_list_extract(resume.get("experience_entries") or []):
         for r in safe_list_extract(exp.get("responsibilities_keywords") or []):
             if r:
@@ -195,20 +200,16 @@ def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
             if t:
                 sections["responsibilities"].append(norm(t))
 
-    # education: education requirements / certifications - fallback to ats_boost_line for keywords
-    # resume JSON may not have explicit education; use ats_boost_line tokens as last resort (still JSON)
     edu = resume.get("education") or []
     for e in safe_list_extract(edu):
         if isinstance(e, str) and e.strip():
             sections["education"].extend(sentence_split(e))
-    # also check skill_proficiency entries for degrees/certs names? keep simple
+
     ats = resume.get("ats_boost_line") or ""
     if ats and not sections["education"]:
-        # pick comma-separated tokens that look like certs/edu (heuristic)
         parts = [p.strip() for p in ats.split(",") if p.strip()]
         sections["education"].extend(parts[:20])
 
-    # overall: combine long text from explainability or concatenated fields
     overall_parts = []
     if resume.get("profile_keywords_line"):
         overall_parts.append(resume.get("profile_keywords_line"))
@@ -218,13 +219,10 @@ def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
     for exp in safe_list_extract(resume.get("experience_entries") or []):
         if exp.get("responsibilities_keywords"):
             overall_parts.extend([r for r in exp.get("responsibilities_keywords") if r])
-    # append ats_boost_line
     if ats:
         overall_parts.append(ats)
-    # sentence split overall
     sections["overall"].extend([s for p in overall_parts for s in sentence_split(p)])
 
-    # trim long lists to MAX_SENT_PER_SECTION for memory safety
     for k in sections:
         if len(sections[k]) > MAX_SENT_PER_SECTION:
             sections[k] = sections[k][:MAX_SENT_PER_SECTION]
@@ -232,12 +230,9 @@ def extract_sections_from_resume(resume: dict) -> Dict[str, List[str]]:
     return sections
 
 # -----------------------
-# JD extractor
+# JD extractor (unchanged)
 # -----------------------
 def extract_sections_from_jd(jd: dict) -> Dict[str, List[str]]:
-    """
-    Map JD fields to our sections. Returns same keys as resume extractor.
-    """
     sections = {
         "profile": [],
         "skills": [],
@@ -247,45 +242,34 @@ def extract_sections_from_jd(jd: dict) -> Dict[str, List[str]]:
         "overall": []
     }
 
-    # profile -> maybe job summary or role_title
     profile_texts = []
     if jd.get("role_title"):
         profile_texts.append(jd.get("role_title"))
     if jd.get("embedding_hints", {}) and jd["embedding_hints"].get("overall_embed"):
         profile_texts.append(jd["embedding_hints"]["overall_embed"])
-    # description / responsibilities
     if jd.get("responsibilities"):
         for r in jd.get("responsibilities"):
             if isinstance(r, str):
                 sections["responsibilities"].extend(sentence_split(r))
-    # skills
     if jd.get("required_skills"):
         sections["skills"].extend([norm(x) for x in jd.get("required_skills")])
     if jd.get("preferred_skills"):
-        # preferred treated separately but also include in skills for overall section embedding
         sections["skills"].extend([norm(x) for x in jd.get("preferred_skills")])
-    # projects: if JD includes desired project types in embedding hints or kpis
     if jd.get("embedding_hints", {}).get("projects_embed"):
         sections["projects"].extend(sentence_split(jd["embedding_hints"]["projects_embed"]))
-    # education / certs
     if jd.get("certifications_required"):
         sections["education"].extend([norm(x) for x in jd.get("certifications_required")])
     if jd.get("education_requirements"):
         sections["education"].extend([norm(x) for x in jd.get("education_requirements")])
-    # overall: responsibilities + summary
     if jd.get("embedding_hints", {}).get("overall_embed"):
         sections["overall"].extend(sentence_split(jd["embedding_hints"]["overall_embed"]))
-    # fallback: keywords_flat
     if not sections["skills"] and jd.get("keywords_flat"):
         sections["skills"].extend([norm(x) for x in jd.get("keywords_flat")])
-
-    # profile: role_title + alt_titles
     if jd.get("role_title"):
         sections["profile"].extend(sentence_split(jd.get("role_title")))
     if jd.get("alt_titles"):
         sections["profile"].extend([norm(x) for x in jd.get("alt_titles") if isinstance(x, str)])
 
-    # deduplicate small
     for k in sections:
         seen = set()
         out = []
@@ -301,72 +285,105 @@ def extract_sections_from_jd(jd: dict) -> Dict[str, List[str]]:
     return sections
 
 # -----------------------
-# Embedding helpers
+# Embedding helpers (OpenAI)
 # -----------------------
-def embed_texts(model: SentenceTransformer, cache: EmbedCache, texts: List[str]) -> np.ndarray:
+def _openai_embed_texts(batch_texts: List[str], model: str) -> List[List[float]]:
     """
-    Returns an array (n_texts, dim) of embeddings. Uses cache where possible.
+    Call OpenAI Embeddings API for a list of texts. Implements retry/backoff.
+    Returns list of embedding vectors (list of floats) in same order.
     """
-    vectors = []
+    attempt = 0
+    while True:
+        try:
+            resp = openai.Embedding.create(model=model, input=batch_texts)
+            # response.data is a list with 'embedding' field
+            embeddings = [d["embedding"] for d in resp["data"]]
+            return embeddings
+        except Exception as e:
+            attempt += 1
+            if attempt > EMBED_RETRIES:
+                raise RuntimeError(f"OpenAI Embeddings failed after {EMBED_RETRIES} tries: {e}")
+            backoff = (EMBED_BACKOFF_BASE ** attempt) + random.random()
+            time.sleep(backoff)
+
+def embed_texts(cache: EmbedCache, texts: List[str]) -> np.ndarray:
+    """
+    Returns (n_texts, dim) normalized embeddings using OpenAI, using cache where possible.
+    """
+    if not texts:
+        return np.zeros((0, 1536), dtype=np.float32)  # fallback shape; will be resized as needed
+
+    vectors = [None] * len(texts)
     to_embed = []
     to_embed_idx = []
     for i, t in enumerate(texts):
         t_norm = t.strip()
-        v = cache.get(t_norm, MODEL_NAME)
+        v = cache.get(t_norm, EMBEDDING_MODEL)
         if v is None:
             to_embed.append(t_norm)
             to_embed_idx.append(i)
-            vectors.append(None)  # placeholder
         else:
-            vectors.append(v)
+            vectors[i] = v
 
-    # embed missing in batches
     if to_embed:
+        # batch up
         for i in range(0, len(to_embed), EMBED_BATCH):
             batch = to_embed[i:i+EMBED_BATCH]
-            emb = model.encode(batch, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
-            for j, vec in enumerate(emb):
-                idx = to_embed_idx[i+j]
-                vectors[idx] = vec
-                cache.set(batch[j], MODEL_NAME, vec)
+            emb_lists = _openai_embed_texts(batch, EMBEDDING_MODEL)
+            for j, emb in enumerate(emb_lists):
+                idx = to_embed_idx[i + j]
+                arr = np.asarray(emb, dtype=np.float32)
+                # normalize
+                norm = np.linalg.norm(arr)
+                if norm > 0:
+                    arr = arr / norm
+                vectors[idx] = arr
+                cache.set(batch[j], EMBEDDING_MODEL, arr)
 
-    # all vectors present now
-    arr = np.vstack([v.reshape(1, -1) if v.ndim == 1 else v for v in vectors]).astype(np.float32)
+    # if any remaining None (shouldn't happen), set zero vector with detected dim
+    dims = [v.shape[0] for v in vectors if v is not None]
+    if dims:
+        d = dims[0]
+    else:
+        # as safe fallback use 1536
+        d = 1536
+    for i, v in enumerate(vectors):
+        if v is None:
+            vectors[i] = np.zeros((d,), dtype=np.float32)
+
+    arr = np.vstack(vectors).astype(np.float32)
+    # ensure normalization (should be normalized already)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    arr = arr / norms
     return arr
 
 def cosine_sim_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Compute cosine similarity matrix between a (m x d) and b (n x d) -> m x n"""
-    # a and b expected to be normalized to unit vectors for efficiency; but ensure safe compute
-    # If normalized, dot product is cosine.
-    # Check norms (small overhead)
-    # We'll assume embeddings were normalized by model.encode(normalize_embeddings=True)
+    # both assumed normalized rows
+    if a.size == 0 or b.size == 0:
+        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
     return np.matmul(a, b.T)
 
 # -----------------------
-# Section scoring
+# Section scoring (unchanged)
 # -----------------------
 def compute_section_score(jd_emb: np.ndarray, resume_emb: np.ndarray) -> Tuple[float, float, float, List[Tuple[int, int, float]]]:
-    """
-    Returns (section_score, coverage, depth, matches_list)
-    matches_list: list of (jd_idx, resume_idx, sim) for top matches
-    """
     if jd_emb.shape[0] == 0:
         return 0.5, 0.0, 0.0, []
     if resume_emb.shape[0] == 0:
         return 0.0, 0.0, 0.0, []
 
     C = cosine_sim_matrix(jd_emb, resume_emb)  # (m x n)
-    max_per_jd = C.max(axis=1)  # for each jd sentence, best resume sim
+    max_per_jd = C.max(axis=1)  # best resume sim per jd sentence
     coverage = float((max_per_jd >= TAU_COV).sum()) / max(1, len(max_per_jd))
     depth = float(max_per_jd.mean())
-    # density: resume sentences that match any JD above TAU_RESUME
     max_per_resume = C.max(axis=0)
     density = float((max_per_resume >= TAU_RESUME).sum()) / max(1, resume_emb.shape[0])
 
     alpha, beta, gamma = SECTION_COMB
     section_score = alpha * coverage + beta * depth + gamma * density
 
-    # build top matches (for explainability): for each jd sentence take best resume sentence
     matches = []
     for j_idx in range(C.shape[0]):
         r_idx = int(C[j_idx].argmax())
@@ -375,7 +392,7 @@ def compute_section_score(jd_emb: np.ndarray, resume_emb: np.ndarray) -> Tuple[f
     return section_score, coverage, depth, matches
 
 # -----------------------
-# Main flow
+# Main flow (preserved)
 # -----------------------
 def main():
     # sanity checks
@@ -400,24 +417,25 @@ def main():
         print("⚠️ No resume JSON files found. Exiting.", file=sys.stderr)
         sys.exit(0)
 
-    # load / init embed model and cache
-    try:
-        model = SentenceTransformer(MODEL_NAME)
-    except Exception as e:
-        print(f"❌ Failed to load embedding model {MODEL_NAME}: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Configure openai from environment if available
+    openai_api_key = 
+    if not openai_api_key:
+        # If user uses AzureOpenAI or different config, OpenAI client may still work if env is set appropriately.
+        print("⚠️ OPENAI_API_KEY not found in environment. OpenAI embeddings may fail.", file=sys.stderr)
+    else:
+        openai.api_key = openai_api_key
+
     cache = EmbedCache(EMBED_CACHE_PATH)
 
     # Pre-embed JD section sentences once
     jd_embeds = {}
     jd_texts = {}
     for sec, sents in jd_sections.items():
-        # for skills section, treat tokens as short phrases; still embed them
         jd_texts[sec] = [norm(s) for s in sents]
         if jd_texts[sec]:
-            jd_embeds[sec] = embed_texts(model, cache, jd_texts[sec])
+            jd_embeds[sec] = embed_texts(cache, jd_texts[sec])
         else:
-            jd_embeds[sec] = np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+            jd_embeds[sec] = np.zeros((0, 1536), dtype=np.float32)
 
     # load existing scores
     if SCORES_FILE.exists():
@@ -451,13 +469,12 @@ def main():
         sec_texts = {}
         for sec in jd_sections.keys():
             texts = sections.get(sec) or []
-            # if empty and sec == 'skills' maybe take skill_proficiency skill names - already included
             texts = [t for t in texts if t and isinstance(t, str)]
             sec_texts[sec] = texts
             if texts:
-                sec_emb[sec] = embed_texts(model, cache, texts)
+                sec_emb[sec] = embed_texts(cache, texts)
             else:
-                sec_emb[sec] = np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+                sec_emb[sec] = np.zeros((0, 1536), dtype=np.float32)
 
         # compute section scores & explainability top matches
         section_scores = {}
@@ -471,7 +488,6 @@ def main():
                 "coverage": round(float(coverage), 3),
                 "depth": round(float(depth), 3)
             }
-            # prepare small explain matches: jd_text, resume_text, sim
             top_matches = []
             for j_idx, r_idx, sim in matches:
                 jd_txt = jd_texts.get(sec, [])[j_idx] if jd_texts.get(sec) and j_idx < len(jd_texts[sec]) else ""
@@ -494,7 +510,7 @@ def main():
             "project_aggregate": existing_map.get(name, {}).get("project_aggregate")
         })
 
-    # close cache to persist
+    # persist cache
     cache.close()
 
     # Normalize raw scores to 0..1 with min-max to produce Semantic_Score
@@ -511,18 +527,15 @@ def main():
         print("⚠️ No candidates processed.", file=sys.stderr)
         sys.exit(0)
 
-    # Sort and print top 10 with Keyword_Score and project aggregate if present
-    # candidate_results.sort(key=lambda x: x["Semantic_Score"], reverse=True)
-    # print("\n🏆 Top 10 candidates by Semantic Score:")
-    for c in candidate_results[:10]:
+    # Print top 10 for logging (keeps parity with original)
+    for c in sorted(candidate_results, key=lambda x: x["Semantic_Score"], reverse=True)[:10]:
         name = c["name"]
         sem = c["Semantic_Score"]
         proj = c.get("project_aggregate")
         keyword = existing_map.get(name, {}).get("Keyword_Score")
-        # print(f"✅ {name} | Semantic_Score={sem} | Keyword_Score={keyword} | project_aggregate={proj}")
+        print(f"✅ {name} | Semantic_Score={sem} | Keyword_Score={keyword} | project_aggregate={proj}")
 
     # Merge into SCORES_FILE: update existing entries or append new ones
-    # Build name->entry map
     out_map = {e.get("name"): e for e in existing_scores if isinstance(e, dict)}
     for c in candidate_results:
         name = c["name"]
@@ -547,11 +560,12 @@ def main():
     except Exception as e:
         print(f"❌ Failed to write scores: {e}", file=sys.stderr)
         if tmp_file.exists():
-            tmp_file.unlink(missing_ok=True)
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
-
