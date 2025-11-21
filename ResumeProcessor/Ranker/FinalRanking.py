@@ -1,77 +1,110 @@
 #!/usr/bin/env python3
 """
-FinalRanking.py — Fixed pathing + safe write for Cloud / GitHub runs
+FinalRanking.py  (patched)
+
+Changes:
+- candidates with only 1 valid score are no longer skipped
+- a decay of 0.08 is applied to make 1-score resumes rank lower without exclusion
+- log skipped candidates with full score breakdown
 """
 
 import json
 from pathlib import Path
 
-ROOT = Path(".")
-INPUT_FILE = ROOT / "Ranking/Scores.json"
-OUTPUT_FILE = ROOT / "Ranking/Final_Ranking.json"
-SKIPPED_FILE = ROOT / "Ranking/Skipped.json"
-DISPLAY_FILE = ROOT / "Ranking/DisplayRanks.txt"   # HR friendly
+# Absolute paths from your current pipeline
+INPUT_FILE = Path("/home/keeda/HR BOT/Ranking/Scores.json")
+OUTPUT_FILE = Path("/home/keeda/HR BOT/Ranking/Final_Ranking.json")
+SKIPPED_FILE = Path("Ranking/Skipped.json")
+DISPLAY_FILE = Path("Ranking/DisplayRanks.txt")
 
-# Pre-allocation (RAM copy for Streamlit live rendering)
-RANKING_RAM = []
-
+# Score weights (unchanged)
 WEIGHTS = {
     "project_aggregate": 0.35,
     "Semantic_Score": 0.35,
     "Keyword_Score": 0.3,
 }
 
-def compute_final_score(entry: dict):
-    scores = {
-        k: v for k, v in {
-            "project_aggregate": entry.get("project_aggregate"),
-            "Semantic_Score": entry.get("Semantic_Score"),
-            "Keyword_Score": entry.get("Keyword_Score"),
-        }.items() if isinstance(v, (int, float)) and v > 0
+# decay to apply when exactly 1 score available
+ONE_SCORE_DECAY = 0.08
+
+
+def compute_final_score(entry: dict) -> float | None:
+    """Return final weighted score or None if no useful score exists."""
+    raw_scores = {
+        "project_aggregate": entry.get("project_aggregate", 0.0),
+        "Semantic_Score": entry.get("Semantic_Score", 0.0),
+        "Keyword_Score": entry.get("Keyword_Score", 0.0),
     }
-    if len(scores) < 2:
+
+    # valid scores = >0.0 values
+    valid_scores = {k: v for k, v in raw_scores.items() if isinstance(v, (int, float)) and v > 0.0}
+
+    # SKIP only if *all* scores are zero
+    if len(valid_scores) == 0:
         return None
 
-    total_w = sum(WEIGHTS[k] for k in scores)
-    return round(sum((WEIGHTS[k]/total_w) * scores[k] for k in scores), 3)
+    # If exactly one valid score → apply minimal constant decay
+    if len(valid_scores) == 1:
+        score_value = list(valid_scores.values())[0]
+        adjusted = max(score_value - ONE_SCORE_DECAY, 0.0)
+        return round(adjusted, 3)
 
-def run_ranking():
-    global RANKING_RAM
+    # 2 or 3 valid scores → weighted formula (normalized weights)
+    total_weight = sum(WEIGHTS[k] for k in valid_scores)
+    final = sum((WEIGHTS[k] / total_weight) * valid_scores[k] for k in valid_scores)
+    return round(final, 3)
 
+
+def main():
     if not INPUT_FILE.exists():
-        print(f"❌ Scores.json missing: {INPUT_FILE}")
-        return []
+        print(f"❌ Input file not found: {INPUT_FILE}")
+        return
 
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+    with INPUT_FILE.open("r", encoding="utf-8") as f:
         candidates = json.load(f)
 
-    ranked = []
-    skipped = []
+    ranked, skipped = [], []
 
-    for entry in candidates:
-        score = compute_final_score(entry)
-        if score is None:
-            entry["reason"] = "insufficient scoring (<2 valid metrics)"
-            skipped.append(entry)
-        else:
-            entry["Final_Score"] = score
-            ranked.append(entry)
+    print("\n🔍 Log of skipped resumes (if any):\n")
 
+    for cand in candidates:
+        final_score = compute_final_score(cand)
+
+        if final_score is None:
+            skipped.append(cand)
+            print(
+                f"⛔ SKIPPED → {cand.get('name')}"
+                f" | Project={cand.get('project_aggregate')}"
+                f" | Semantic={cand.get('Semantic_Score')}"
+                f" | Keyword={cand.get('Keyword_Score')}"
+            )
+            continue
+
+        cand["Final_Score"] = final_score
+        ranked.append(cand)
+
+    # Sort in descending order
     ranked.sort(key=lambda x: x["Final_Score"], reverse=True)
-    RANKING_RAM = ranked   # update in-memory version for UI
 
-    # Write storage files (works even on local)
+    # Guarantee ranking file folder exists
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+
+    # Write JSON outputs
+    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
         json.dump(ranked, f, indent=4)
-    with open(SKIPPED_FILE, "w", encoding="utf-8") as f:
+
+    with SKIPPED_FILE.open("w", encoding="utf-8") as f:
         json.dump(skipped, f, indent=4)
-    with open(DISPLAY_FILE, "w", encoding="utf-8") as f:
+
+    # Write human-readable text ranking
+    with DISPLAY_FILE.open("w", encoding="utf-8") as f:
         for i, cand in enumerate(ranked, start=1):
             f.write(f"{i}. {cand['name']} | {cand['Final_Score']}\n")
 
-    print(f"🏆 Ranking complete ({len(ranked)} candidates)")
-    return ranked
+    print(f"\n🏆 Final ranking written → {OUTPUT_FILE} ({len(ranked)} candidates)")
+    print(f"⚠️ Skipped entries written → {SKIPPED_FILE} ({len(skipped)} candidates)")
+    print(f"📄 HR-friendly display → {DISPLAY_FILE}\n")
+
 
 if __name__ == "__main__":
-    run_ranking()
+    main()
