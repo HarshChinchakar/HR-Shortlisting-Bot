@@ -1,4 +1,4 @@
-# HR Hiring Bot — Full Documentation
+# HR Hiring Bot — OPTIMIZED ATS SYSTEM
 
 ---
 
